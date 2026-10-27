@@ -1,0 +1,106 @@
+---
+title: "Projet_stat_avancé"
+output: html_document
+date: "2026-10-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# Chargement des packages et du jeu de données
+
+```{r cars}
+library(modeldata) # Pour charger les données attrition
+library(rsample)
+library(yardstick)
+library(dplyr)
+library(tidyr)
+library(tibble)
+# ou plus simplement library(tidyverse)
+
+set.seed(123)
+```
+
+## Introduction
+
+# Analyse jeu de donnée
+
+```{r}
+prop.table(table(train$Attrition))  
+# on remarque un déséquilibre : ~16 % de "Yes"
+
+str(attrition)
+```
+
+
+# Séparation train / test (par rapport à la variable cible)
+
+```{r}
+split <- initial_split(attrition, prop = 0.75, strata = Attrition)
+train <- training(split)
+test  <- testing(split)
+```
+
+
+# Première prévision
+
+```{r}
+fit0   <- glm(Attrition ~ 1, data = train, family = binomial) # modèlme logistique sans variables explicatives (juste le seuil)
+proba0 <- predict(fit0, newdata = test, type = "response")
+prev_P1 <- factor(ifelse(proba0 >= 0.5, "Yes", "No"), # Seuil usuel à 0.5
+                  levels = levels(test$Attrition))
+```
+
+# Deuxième prévision
+
+```{r}
+fit <- glm(Attrition ~ OverTime + MonthlyIncome + Age + JobSatisfaction +
+             WorkLifeBalance + YearsAtCompany + DistanceFromHome + BusinessTravel,
+           data = train, family = binomial)
+
+proba <- predict(fit, newdata = test, type = "response")
+
+# seuil = proportion de "Yes" dans le train (au lieu de 0.5)
+seuil <- mean(train$Attrition == "Yes")
+prev_P2 <- factor(ifelse(proba >= seuil, "Yes", "No"),
+                  levels = levels(test$Attrition))
+
+```
+
+# Tables de contingences
+
+```{r}
+table(Prevision_1 = prev_P1, Y = test$Attrition)
+table(Prevision_2 = prev_P2, Y = test$Attrition)
+```
+
+# Score accuracy
+
+```{r}
+
+comparaison <- tibble(
+  Modele = c("P1 (modèle naif)", "P2 (logistique, seuil adapté)"),
+  Accuracy = c(
+    accuracy_vec(truth = test$Attrition, estimate = prev_P1),
+    accuracy_vec(truth = test$Attrition, estimate = prev_P2)
+  ), # on prend une règle classique
+  Sensibilite = c(
+    sens_vec(truth = test$Attrition, estimate = prev_P1, event_level = "second"),
+    sens_vec(truth = test$Attrition, estimate = prev_P2, event_level = "second")
+  ),
+  Nb_departs_detectes = c(
+    sum(prev_P1 == "Yes" & test$Attrition == "Yes"),
+    sum(prev_P2 == "Yes" & test$Attrition == "Yes")
+  ),
+  Nb_departs_reels = sum(test$Attrition == "Yes")
+)
+
+comparaison |>
+  mutate(across(c(Accuracy, Sensibilite), \(x) round(x, 3)))
+```
+
+
+
