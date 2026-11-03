@@ -20,6 +20,9 @@ library(dplyr)
 library(tidyr)
 library(tibble)
 # ou plus simplement library(tidyverse)
+library(randomForest)
+library(ggplot2)
+
 
 set.seed(123)
 ```
@@ -28,13 +31,19 @@ set.seed(123)
 
 # Analyse jeu de donnée
 
-```{r}
-prop.table(table(train$Attrition))  
-# on remarque un déséquilibre : ~16 % de "Yes"
+# Affichage des premières tables
 
-str(attrition)
+```{r}
+library(modeldata)
+data("attrition")
+
+head(attrition)
+
 ```
 
+```{r}
+names(attrition)
+```
 
 # Séparation train / test (par rapport à la variable cible)
 
@@ -45,62 +54,288 @@ test  <- testing(split)
 ```
 
 
-# Première prévision
-
 ```{r}
-fit0   <- glm(Attrition ~ 1, data = train, family = binomial) # modèlme logistique sans variables explicatives (juste le seuil)
-proba0 <- predict(fit0, newdata = test, type = "response")
-prev_P1 <- factor(ifelse(proba0 >= 0.5, "Yes", "No"), # Seuil usuel à 0.5
-                  levels = levels(test$Attrition))
+prop.table(table(train$Attrition))  
+# on remarque un déséquilibre : ~16 % de "Yes"
+
+str(attrition)
 ```
 
-# Deuxième prévision
 
 ```{r}
-fit <- glm(Attrition ~ OverTime + MonthlyIncome + Age + JobSatisfaction +
-             WorkLifeBalance + YearsAtCompany + DistanceFromHome + BusinessTravel,
-           data = train, family = binomial)
-
-proba <- predict(fit, newdata = test, type = "response")
-
-# seuil = proportion de "Yes" dans le train (au lieu de 0.5)
-seuil <- mean(train$Attrition == "Yes")
-prev_P2 <- factor(ifelse(proba >= seuil, "Yes", "No"),
-                  levels = levels(test$Attrition))
-
+formule <- Attrition ~ OverTime + MonthlyIncome + Age +
+  JobSatisfaction + WorkLifeBalance + YearsAtCompany +
+  DistanceFromHome + BusinessTravel +
+  JobRole + EnvironmentSatisfaction + YearsSinceLastPromotion
 ```
 
-# Tables de contingences
+
+# Entrainement de la forêt aléatoire
 
 ```{r}
-table(Prevision_1 = prev_P1, Y = test$Attrition)
-table(Prevision_2 = prev_P2, Y = test$Attrition)
+set.seed(123)
+
+modele_rf <- randomForest(
+  formula = formule,
+  data = train,
+  ntree = 500
+)
 ```
 
-# Score accuracy
+# proportion d'arbres qui peredisent "yes" pour chq individu 
 
 ```{r}
+proba_rf <- predict(
+  modele_rf,
+  newdata = test,
+  type = "prob"
+)[, "Yes"]
+```
 
-comparaison <- tibble(
-  Modele = c("P1 (modèle naif)", "P2 (logistique, seuil adapté)"),
-  Accuracy = c(
-    accuracy_vec(truth = test$Attrition, estimate = prev_P1),
-    accuracy_vec(truth = test$Attrition, estimate = prev_P2)
-  ), # on prend une règle classique
-  Sensibilite = c(
-    sens_vec(truth = test$Attrition, estimate = prev_P1, event_level = "second"),
-    sens_vec(truth = test$Attrition, estimate = prev_P2, event_level = "second")
-  ),
-  Nb_departs_detectes = c(
-    sum(prev_P1 == "Yes" & test$Attrition == "Yes"),
-    sum(prev_P2 == "Yes" & test$Attrition == "Yes")
-  ),
-  Nb_departs_reels = sum(test$Attrition == "Yes")
+
+```{r}
+head(proba_rf)
+```
+```{r}
+# LE SCORE DE départ (yes = quitte l'entreprise) respectivement des individus 2,7,8,12....
+```
+
+# regroupement des vrais classes et leurs scores
+
+
+```{r}
+comparaison_rf <- data.frame(
+  Observation = names(proba_rf),
+  Score_depart = as.numeric(proba_rf),
+  Prediction = ifelse(proba_rf >= 0.5, "Yes", "No"),
+  Realite = test$Attrition
 )
 
-comparaison |>
-  mutate(across(c(Accuracy, Sensibilite), \(x) round(x, 3)))
+head(comparaison_rf)
 ```
 
 
 
+```{r}
+resultats_rf <- tibble::tibble(
+  Attrition = test$Attrition,
+  score = as.numeric(proba_rf)
+)
+```
+
+
+# Deuxième modele: regression logistique
+
+```{r}
+modele_log <- glm(
+  formula = formule,
+  data = train,
+  family = binomial
+)
+```
+
+```{r}
+# probabilité de depart
+
+score_log <- predict(
+  modele_log,
+  newdata = test,
+  type = "response"
+)
+```
+
+
+
+```{r}
+comparaison_log <- data.frame(
+  Observation = names(proba_rf),
+  Score_depart = as.numeric(score_log),
+  Prediction = ifelse(score_log >= 0.5, "Yes", "No"),
+  Realite = test$Attrition
+)
+
+head(comparaison_log)
+```
+
+
+
+
+
+# score des deux modèles 
+
+```{r}
+resultats <- tibble::tibble(
+  Attrition = test$Attrition,
+  score_rf = as.numeric(proba_rf),
+  score_log = as.numeric(score_log)
+)
+
+head(resultats)
+```
+
+# tableau commum 
+
+```{r}
+resultats <- tibble(
+  Attrition = factor(test$Attrition, levels = c("No", "Yes")),
+  Foret = as.numeric(proba_rf),
+  Logistique = as.numeric(score_log)
+)
+```
+
+
+# calcul des deux courbes de roc 
+
+```{r}
+roc_rf <- roc_curve(
+  resultats,
+  truth = Attrition,
+  Foret,
+  event_level = "second"
+)
+
+roc_log <- roc_curve(
+  resultats,
+  truth = Attrition,
+  Logistique,
+  event_level = "second"
+)
+```
+
+# Affichage
+
+```{r}
+courbes_roc <- bind_rows(
+  roc_rf |> mutate(Modele = "Forêt aléatoire"),
+  roc_log |> mutate(Modele = "Régression logistique")
+)
+
+ggplot(
+  courbes_roc,
+  aes(x = 1 - specificity, y = sensitivity, color = Modele)
+) +
+  geom_path(linewidth = 1) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    color = "grey"
+  ) +
+  coord_equal() +
+  labs(
+    title = "Comparaison des courbes ROC",
+    x = "Taux de faux positifs",
+    y = "Taux de vrais positifs — rappel",
+    color = "Modèle"
+  ) +
+  theme_minimal()
+```
+
+#Les deux modèles présentent une capacité de discrimination supérieure au #hasard. La régression logistique semble légèrement meilleure sur une #grande partie des seuils, mais les courbes sont proches. Le calcul des AUC permettra de comparer leur discrimination globale sur le jeu de test. »
+
+# calcul des AUC
+
+
+```{r}
+comparaison_auc <- bind_rows(
+  roc_auc(
+    resultats, Attrition, Foret,
+    event_level = "second"
+  ) |> mutate(Modele = "Forêt aléatoire"),
+
+  roc_auc(
+    resultats, Attrition, Logistique,
+    event_level = "second"
+  ) |> mutate(Modele = "Régression logistique")
+) |>
+  select(Modele, AUC = .estimate)
+
+comparaison_auc
+```
+#Les deux modèles discriminent mieux que le hasard. La régression logistique obtient une AUC de 0,820, contre 0,790 pour la forêt aléatoire. Elle présente donc une meilleure discrimination globale sur ce jeu de test.
+
+
+
+# Calcul du gain et le lift 
+
+
+```{r}
+
+courbes_gain_lift <- resultats |>
+  pivot_longer(
+    cols = c(Foret, Logistique),
+    names_to = "Modele",
+    values_to = "score"
+  ) |>
+  group_by(Modele) |>
+  arrange(desc(score), .by_group = TRUE) |>
+  mutate(
+    # Regrouper les salariés qui ont le même score
+    positifs_cumules = cumsum(Attrition == "Yes"),
+    population = row_number() / n(),
+    gain = positifs_cumules / sum(Attrition == "Yes")
+  ) |>
+  filter(!duplicated(score, fromLast = TRUE)) |>
+  mutate(
+    lift = gain / population
+  ) |>
+  ungroup()
+```
+
+# courbe de gain cumulé
+
+```{r}
+depart <- tibble::tibble(
+  Modele = c("Foret", "Logistique"),
+  population = 0,
+  gain = 0
+)
+
+ggplot(
+  bind_rows(depart, courbes_gain_lift),
+  aes(x = population, y = gain, color = Modele)
+) +
+  geom_line(linewidth = 1) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    color = "grey"
+  ) +
+  scale_x_continuous(labels = scales::label_percent()) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(
+    title = "Comparaison des gains cumulés",
+    x = "Proportion de salariés sélectionnés",
+    y = "Proportion des départs retrouvés",
+    color = "Modèle"
+  ) +
+  theme_minimal()
+```
+
+
+
+# Courbe de lift
+
+```{r}
+ggplot(
+  courbes_gain_lift,
+  aes(x = population, y = lift, color = Modele)
+) +
+  geom_line(linewidth = 1) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed",
+    color = "grey"
+  ) +
+  scale_x_continuous(labels = scales::label_percent()) +
+  labs(
+    title = "Comparaison des lifts cumulés",
+    x = "Proportion de salariés sélectionnés",
+    y = "Lift cumulé",
+    color = "Modèle"
+  ) +
+  theme_minimal()
+```
+
+#La régression logistique est généralement légèrement plus performante, notamment autour de 25 % de salariés sélectionnés : elle retrouve environ 68 % des départs, contre 60 % pour la forêt aléatoire, soit des lifts respectifs d’environ 2,7 et 2,4.
