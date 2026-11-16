@@ -1,0 +1,325 @@
+---
+title: "TD : évaluer un modèle sur données déséquilibrées"
+output: html_document
+date: "2026-10-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center",
+                      fig.width = 6.5, fig.height = 4.5)
+```
+
+**Objectifs du TD**
+
+- Comprendre pourquoi l'accuracy est trompeuse quand les classes sont déséquilibrées
+- Savoir calculer et interpréter : balanced accuracy, J de Youden, kappa de Cohen, F1-score
+- Savoir lire : courbe ROC, AUC, courbes de gain et de lift
+
+### I. Packages
+
+```{r packages}
+library(tidymodels)   # rsample, recipes, parsnip, workflows, yardstick, ggplot2...
+library(modeldata)    # jeu de données attrition
+library(ranger)       # forêt aléatoire
+library(forcats)      # fct_relevel
+```
+
+### II. Le jeu de données
+
+`attrition` est un jeu fictif créé par IBM : 1 470 employés d'une entreprise, 30 variables explicatives (âge, salaire, heures supplémentaires, distance domicile-travail, satisfaction, etc.) et une variable cible `Attrition` : l'employé a-t-il quitté l'entreprise (`Yes`) ou non (`No`) ?
+
+```{r}
+data(attrition)
+dim(attrition)
+levels(attrition$Attrition)
+```
+
+```{r}
+attrition |>
+  count(Attrition) |>
+  mutate(proportion = round(n / sum(n), 2))
+```
+
+Environ 16 % d'employés « Yes » contre 84 % de « No », la classe minoritaire est précisément celle qui nous intéresse
+
+**Objectif :**
+
+Prédire les employés qui vont quitter l'entreprise, afin que les RH puissent agir (entretien, ajustement de poste, etc.)
+
+**Question :** quelle erreur est la plus coûteuse pour l'entreprise ?
+
+- Un faux négatif (FN) : on prédit « il reste » alors qu'il part
+- Un faux positif (FP) : on prédit « il part » alors qu'il reste
+
+**Réponse :** Ici, le FN coûte en général plus cher (remplacer un employé coûte cher, un entretien non). Il faudra donc une métrique qui regarde bien la classe « Yes »
+
+### III. Préparation des données
+
+Par défaut, la bibliothèque `yardstick` considère le premier niveau du facteur comme la classe « positive ». Or R classe les niveaux par ordre alphabétique, donc « No » serait positif. On remet « Yes » en premier pour que positif = départ de l'employé
+
+```{r}
+attrition <- attrition |>
+  mutate(Attrition = fct_relevel(Attrition, "Yes"))
+
+levels(attrition$Attrition)
+```
+
+```{r}
+set.seed(123)
+split <- initial_split(attrition, prop = 0.75, strata = Attrition)
+train <- training(split)
+test  <- testing(split)
+
+# vérification : proportions identiques
+bind_rows(
+  train |> count(Attrition) |> mutate(jeu = "train"),
+  test  |> count(Attrition) |> mutate(jeu = "test")) |>
+  group_by(jeu) |>
+  mutate(proportion = round(n / sum(n), 2))
+```
+
+### IV. Premier modèle : la régression logistique
+
+On utilise une recipe qui transforme les variables qualitatives en indicatrices et supprime les variables constantes.
+
+```{r}
+rec <- recipe(Attrition ~ ., data = train) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+
+wf_glm <- workflow() |>
+  add_recipe(rec) |>
+  add_model(logistic_reg() |> set_engine("glm"))
+
+fit_glm <- fit(wf_glm, data = train)
+```
+
+```{r}
+res <- test |>
+  select(Attrition) |>
+  mutate(
+    prob_glm = predict(fit_glm, test, type = "prob")$.pred_Yes,
+    pred_glm = predict(fit_glm, test, type = "class")$.pred_class
+  )
+
+head(res)
+```
+
+Le seuil pour la classe est fixé à 0.5 par défaut
+
+```{r}
+conf_mat(res, truth = Attrition, estimate = pred_glm)
+```
+
+### V. Métriques « classiques »
+
+| Métrique | Formule | Question à laquelle elle répond |
+|----|----|----|
+| **Accuracy** | (VP + VN) / total | Quelle proportion de prédictions est correcte ? |
+| **Précision** | VP / (VP + FP) | Parmi ceux que je prédis « part », combien partent vraiment ? |
+| **Rappel / sensibilité** | VP / (VP + FN) | Parmi ceux qui partent, combien en ai-je détectés ? |
+| **Spécificité** | VN / (VN + FP) | Parmi ceux qui restent, combien ai-je bien identifiés ? |
+
+```{r}
+mes_classiques <- metric_set(accuracy, precision, recall, spec)
+mes_classiques(res, truth = Attrition, estimate = pred_glm)
+```
+
+**Modèle "naïf"** (qui répond toujours "No")
+
+```{r }
+res <- res |>
+  mutate(pred_naif = factor(rep("No", n()), levels = levels(Attrition)))
+
+conf_mat(res, truth = Attrition, estimate = pred_naif)
+mes_classiques(res, truth = Attrition, estimate = pred_naif)
+```
+
+Sur des données déséquilibrées, une accuracy élevée peut cacher un modèle inutile. Il faut des métriques qui tiennent compte des deux classes
+
+### VI. Métriques dépendantes du seuil
+
+Ces métriques évaluent des classes prédites
+
+| Métrique | Formule | Définition |
+|----|----|----|
+| **Balanced accuracy** | $\frac{\text{sensibilité} + \text{spécificité}}{2}$ | Moyenne des taux de bonne classification de chaque classe (la baseline naïve obtient exactement 0,5) |
+| **J de Youden** | $\text{sensibilité} + {spécificité} - 1$ | Balanced accuracy recentrée pour que le hasard vaille 0 au lieu de 0,5 |
+| **Kappa de Cohen** | $\frac{p_o - p_e}{1 - p_e}$ | Où $p_o$ est l'accuracy observée et $p_e$ l'accuracy attendue par hasard |
+| **F1-score** | $\frac{2 \times \text{précision} \times \text{rappel}}{\text{précision} + \text{rappel}}$ | Ignore les vrais négatifs, se concentre sur la classe positive =\> Faible dès que l'une des deux composantes est faible |
+
+**Application** : baseline vs régression logistique
+
+```{r}
+mesures <- metric_set(accuracy, sens, spec, precision, bal_accuracy, j_index, kap, f_meas)
+mesures(res, truth = Attrition, estimate = pred_glm) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+```
+
+```{r}
+bind_rows(
+  mesures(res, truth = Attrition, estimate = pred_naif) |> mutate(modele = "Toujours No"),
+  mesures(res, truth = Attrition, estimate = pred_glm)  |> mutate(modele = "Régression logistique")
+) |>
+  select(modele, .metric, .estimate) |>
+  pivot_wider(names_from = modele, values_from = .estimate) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+```
+
+L'accuracy est quasi identique pour les deux, alors que balanced accuracy, kappa, F1 et MCC séparent plus nettement la baseline du vrai modèle.
+
+### VII. Métriques indépendantes du seuil
+
+Elles évaluent la qualité du classement des probabilités : le modèle donne-t-il des probabilités plus élevées aux vrais « Yes » qu'aux vrais « No » ?
+
+#### VII.1. Courbe ROC et AUC
+
+La courbe ROC trace la sensibilité (taux de VP) en fonction de 1 - spécificité (taux de FP) pour tous les seuils possibles
+
+```{r}
+roc_glm <- roc_curve(res, truth = Attrition, prob_glm)
+autoplot(roc_glm)
+roc_auc(res, truth = Attrition, prob_glm)
+```
+
+- La diagonale correspond au hasard (AUC = 0,5)
+- Plus la courbe est proche du coin supérieur gauche, mieux c'est (AUC → 1)
+- Interprétation : probabilité qu'un employé « Yes » tiré au hasard ait une probabilité prédite plus élevée qu'un employé « No » tiré au hasard
+
+#### VII.2. Courbes de gain cumulé et de lift
+
+Principe : on classe les employés par probabilité décroissante et on regarde ce qu'on obtient en ne « contactant » que les x% les mieux classés.
+
+- **Courbe de gain cumulé :** part des vrais « Yes » retrouvés (axe y) en fonction de la part d'employés contactés (axe x)
+- **Courbe de lift :** rapport entre le taux de « Yes » dans la population contactée et le taux global. Un lift de 3 à 10 % signifie qu'on trouve 3 fois plus de départs qu'en ciblant au hasard.
+
+```{r}
+autoplot(gain_curve(res, truth = Attrition, prob_glm))
+autoplot(lift_curve(res, truth = Attrition, prob_glm))
+```
+
+**Question :** si les RH ne peuvent rencontrer que 25 % des employés, quelle part des départs peuvent-ils anticiper avec ce modèle, contre combien au hasard ?
+
+### VIII. Comparer des modèles : glm vs forêt aléatoire vs baseline
+
+Les courbes prennent tout leur sens quand on compare plusieurs modèles. On ajoute une forêt aléatoire, sans réglage
+
+```{r}
+wf_rf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(rand_forest(trees = 500) |>
+              set_engine("ranger") |>
+              set_mode("classification"))
+
+set.seed(123)
+fit_rf <- fit(wf_rf, data = train)
+
+res <- res |>
+  mutate(
+    prob_rf = predict(fit_rf, test, type = "prob")$.pred_Yes,
+    pred_rf = predict(fit_rf, test, type = "class")$.pred_class,
+    pred_rf_seuil = factor(if_else(prob_rf > 0.5, "Yes", "No"),
+                           levels = levels(Attrition))
+  )
+```
+
+**Métriques dépendantes du seuil**
+
+```{r}
+bind_rows(
+  mesures(res, truth = Attrition, estimate = pred_naif) |> mutate(modele = "Toujours No"),
+  mesures(res, truth = Attrition, estimate = pred_glm)  |> mutate(modele = "Régression logistique"),
+  mesures(res, truth = Attrition, estimate = pred_rf)   |> mutate(modele = "Forêt aléatoire")
+) |>
+  select(modele, .metric, .estimate) |>
+  pivot_wider(names_from = modele, values_from = .estimate) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+**Question :** que constate-t-on pour la sensibilité de la forêt aléatoire avec un seuil de 0,5 ? Pourquoi ?
+
+La forêt vote à la majorité, donc la classe majoritaire « écrase » la minoritaire : très peu de « Yes » prédits, rappel faible, alors que l'accuracy paraît correcte
+
+**Métriques indépendantes du seuil**
+
+```{r auc-comparaison}
+bind_rows(
+  roc_auc(res, truth = Attrition, prob_glm) |> mutate(modele = "Régression logistique"),
+  roc_auc(res, truth = Attrition, prob_rf)  |> mutate(modele = "Forêt aléatoire")
+) |>
+  select(modele, .metric, .estimate) |>
+  pivot_wider(names_from = modele, values_from = .estimate) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+**Les courbes superposées**
+
+```{r}
+modeles <- c(prob_glm = "Régression logistique", prob_rf = "Forêt aléatoire")
+
+courbes <- function(fun, nom_col) {
+  imap_dfr(modeles, function(nom, col) {
+    d <- res |> mutate(.p = .data[[col]])
+    fun(d, truth = Attrition, .p) |> mutate(modele = nom)
+  })
+}
+
+roc_all  <- courbes(roc_curve,  "roc")
+pr_all   <- courbes(pr_curve,   "pr")
+gain_all <- courbes(gain_curve, "gain")
+lift_all <- courbes(lift_curve, "lift")
+
+p_roc <- ggplot(roc_all, aes(1 - specificity, sensitivity, color = modele)) +
+  geom_line(linewidth = 1) + geom_abline(linetype = 2) +
+  labs(title = "ROC", x = "1 - spécificité", y = "Sensibilité") + theme(legend.position = "bottom")
+
+p_pr <- ggplot(pr_all, aes(recall, precision, color = modele)) +
+  geom_line(linewidth = 1) + geom_hline(yintercept = 0.5, linetype = 2) +
+  labs(title = "Précision-rappel (pointillé = prévalence)", x = "Rappel", y = "Précision") +
+  theme(legend.position = "bottom")
+
+p_gain <- ggplot(gain_all, aes(.percent_tested, .percent_found, color = modele)) +
+  geom_line(linewidth = 1) + geom_abline(linetype = 2) +
+  labs(title = "Gain cumulé", x = "% d'employés contactés", y = "% de départs trouvés") +
+  theme(legend.position = "bottom")
+
+p_lift <- ggplot(lift_all, aes(.percent_tested, .lift, color = modele)) +
+  geom_line(linewidth = 1) + geom_hline(yintercept = 1, linetype = 2) +
+  labs(title = "Lift", x = "% d'employés contactés", y = "Lift") +
+  theme(legend.position = "bottom")
+
+# Assemblage 2 x 2 (sans package supplémentaire)
+library(grid)
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(2, 2)))
+print(p_roc,  vp = viewport(layout.pos.row = 1, layout.pos.col = 1))
+print(p_pr,   vp = viewport(layout.pos.row = 1, layout.pos.col = 2))
+print(p_gain, vp = viewport(layout.pos.row = 2, layout.pos.col = 1))
+print(p_lift, vp = viewport(layout.pos.row = 2, layout.pos.col = 2))
+```
+
+**Question :** Quel modèle choisiriez-vous ? Les conclusions sont-elles les mêmes selon la métrique ?
+
+*S*i les courbes se croisent ou sont proches, aucun modèle ne domine partout. Le choix dépend de la zone qui compte (ici, les premiers pourcentages de la liste ciblée, donc le début de la courbe de gain et du lift).
+
+### IX. Récapitulatif
+
+| Métrique | Formule / idée | Dépend du seuil ? | Fiable si classes déséquilibrées ? | À utiliser quand |
+|----|:--:|:--:|:--:|----|
+| **Accuracy** | $\frac{(VP+VN)}{total}$ | Oui | **Non** | Classes équilibrées, coûts d'erreur symétriques |
+| **Précision** | $\frac{VP}{(VP+FP)}$ | Oui | Oui | Les FP coûtent cher |
+| **Rappel (sensibilité)** | $\frac{VP}{(VP+FN)}$ | Oui | Oui | Les FN coûtent cher |
+| **Spécificité** | $\frac{VN}{(VN+FP)}$ | Oui | Oui | On veut limiter les fausses alertes |
+| **Balanced accuracy** | $\frac{(sensibilité + spécificité)}{2}$ | Oui | Oui | Résumé simple, classes déséquilibrées |
+| **J de Youden** | $\text{sensibilité} + \text{spécificité }-1$ | Oui | Oui | Comme la balanced accuracy |
+| **Kappa de Cohen** | $\frac{(p_o − p_e)}{(1 − p_e)}$ | Oui | Partiellement | Accord corrigé du hasard |
+| **F1** | $\frac{2*\text{précision}*\text{rappel}}{(\text{précision}+\text{rappel})}$ | Oui | Oui | Équilibre précision/rappel sur la classe positive |
+| **ROC AUC** | aire sous la courbe ROC | Non | Peut être optimiste | Comparer le classement des modèles |
+| **Gain / lift** | gain par rapport au ciblage aléatoire | Non | Oui | Cibler une fraction limitée (campagnes, RH) |
+
+### X. A retenir
+
+1.  **Ne jamais se contenter de l'accuracy** quand les classes sont déséquilibrées : comparez toujours à la baseline naïve
+2.  **Distinguer les métriques** qui évaluent une décision (dépendent du seuil) de celles qui évaluent un classement (indépendantes du seuil)
+3.  **Le choix de la métrique dépend du coût des erreurs** : ici, rater un départ (FN) coûte plus cher qu'un entretien inutile (FP), donc rappel, PR AUC et lift comptent plus que l'accuracy
+4.  **Le seuil par défaut (0,5) n'est presque jamais adapté** : c'est ce qui motive les méthodes de rééquilibrage présentées dans la partie suivante
